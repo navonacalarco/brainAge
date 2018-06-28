@@ -1,0 +1,199 @@
+---
+title: "brainAge"
+---
+
+```{r_data}
+
+#load packages
+  library(plotrix)
+  library(lsr)
+  library(randomForest)
+  library(ggRandomForests)
+  library(randomForestSRC)
+  library(Hmisc)
+  library(ROCR)
+  library(reprtree)
+  library(missForest)
+
+#bring in data
+df <- read.csv("features.csv") #contains subject ID, training vs. testing set assignment, and 125 features
+demo <- read.csv("demographics.csv") #contains subject ID, diagnosis, and age
+
+#split up training and testing sets into seperate dfs
+df_train <- df[(df$trainTest=="1"),] 
+df_test <- df[(df$trainTest=="2"),]
+
+#make a list of subject IDs in training and testing sets, respectively
+train_ids <- df_train$ID
+test_ids <- df_test$ID 
+
+#get list of rows that training set is in
+train_rows <- which(df$trainTest == '1')
+
+#keep only variables used in random forest
+df_train <- df_train[,grepl('ncog|CT|FA', names(df_train))]
+df_test <- df_test[,grepl('ncog|CT|FA', names(df_test))]
+
+```
+
+```{r training}
+
+#set random seed
+set.seed(1234) 
+
+#run random forest
+rf <- randomForest(age ~ ., data = df, subset = train_rows, ntree=10000, keep.forest=TRUE, importance=TRUE) 
+
+#review random forest
+  plot(rf) #plot the error vs. number of trees
+  reprtree:::plot.getTree(rf) #plot tree visualization
+  (tree <- getTree(rf, k=1, labelVar=TRUE)) #print values in tree
+
+#review importance of variables
+  imp <- importance(rf) #calculate importance of each variable
+  imp[order(imp[,1]),] #ordered from least to most
+  imp_plot <- varImpPlot(rf) #plot
+
+```
+
+```{r testing}
+
+#impute missing predictor data
+impute <- missForest(df_test[,grepl('ncog|CT|FA', names(df_test))]) 
+
+#run rf to obtain predicted age
+predictedage <- predict(rf, impute$ximp) 
+
+#add predicted age to df
+df_test$pred_age <- predictedage 
+
+#merge dfs into new age_df
+df_test$record_id <- test_ids 
+age_df <- merge(df_test, demo, by='record_id')
+
+#add column for delta 
+age_df$delta <- age_df$pred_age - age_df$age
+
+#add column for absolute value of delta
+age_df$delta_abs <- abs(age_df$pred_age - age_df$age) 
+
+```
+
+```{r table}
+
+#make sure that diagnosis is a factor
+age_df$dx<- as.factor(age_df$dx)
+
+#define factors
+dxs <- factor(x = c('BD', 'HC', 'SCZ'), levels = c('BD', 'HC', 'SCZ'))
+    j <- 1
+    k <- 1
+
+#define variables for table
+age_vars <- c('age', 'pred_age', 'delta', 'delta_abs')
+
+#make table
+age_table <- data.frame(matrix(ncol=6, nrow=length(age_vars)))
+names(age_table) <- c('BD', 'HC', 'SCZ', '_p_', 'effect size', 'post hoc')
+row.names(age_table) <- c('real age','predicted age', 'age delta (predicted age - real age)', 'age delta absolute value')
+
+#for loop
+for (var in age_vars) {
+    
+  #calculate means and SDs for each dx
+  for (dx in dxs) {
+  
+  M <- sprintf('%.02f', mean(age_df[age_df$dx == dx, var], na.rm = TRUE))
+  SD <- sprintf('%.02f', sd(age_df[age_df$dx == dx, var], na.rm = TRUE))
+  age_table[j,k] <- paste( M,' (',SD,')', sep='') 
+  k <- k + 1 # advance counter to next column (i.e., next dx)
+  }
+
+      #run one-way ANOVA with dx as between-subjects variable
+          F_test <- aov(age_df[[var]] ~ age_df$dx, na.action=na.omit)
+      #extract p-value
+          F_test.p.value <- summary(F_test)[[1]][["Pr(>F)"]][[1]]
+      #rounded p-value to 3 decimals and without leading zero
+          F_test.p <- sub("^(-?)0.", "\\1.", sprintf("%.3f", F_test.p.value))
+          age_table[j,k] <- F_test.p 
+
+    k <- k + 1 #advance counter
+      
+          #calculation of effect size (eta squared)
+          etaSquared <- etaSquared(F_test)[1]
+          #rounded eta squared to 3 decimals and without leading zero
+          etaSquared <- sub("^(-?)0.", "\\1.", sprintf("%.3f", etaSquared))
+          age_table[j,k] <- paste(etaSquared)
+      
+    k <- k + 1 #advance counter
+      
+      #calculation of pairwise t-tests if significant ANOVA
+          if (F_test.p.value < .05) { 
+            pairwise_results <- vector()
+            if (t.test(age_df[[var]] ~ dx, data = age_df, age_df$dx == "BD" | age_df$dx == "HC")$p.value < .05) { 
+              if (mean(age_df[age_df$dx == "BD", var], na.rm = TRUE) > mean(age_df[age_df$dx == "HC", var], na.rm = TRUE)) { 
+                pairwise_results <- 'BD > HC'
+              } else {
+                pairwise_results <- 'HC > BD'
+              }
+            }
+            if (t.test(age_df[[var]] ~ dx, data = age_df, age_df$dx == "BD" | age_df$dx == "SCZ")$p.value < .05) { 
+              if (mean(age_df[age_df$dx == "BD", var], na.rm = TRUE) > mean(age_df[age_df$dx == "SCZ", var], na.rm = TRUE)) {
+                pairwise_results <- paste(pairwise_results, 'BD > SCZ', sep = ', ') 
+              } else {
+                pairwise_results <- paste(pairwise_results, 'SCZ > BD', sep = ', ')
+              }
+            }
+            if (t.test(age_df[[var]] ~ dx, data = age_df, age_df$dx == "HC" | age_df$dx == "SCZ")$p.value < .05) {
+              if (mean(age_df[age_df$dx == "HC", var], na.rm = TRUE) > mean(age_df[age_df$dx == "SCZ", var], na.rm = TRUE)) {
+                pairwise_results <- paste(pairwise_results, 'HC > SCZ', sep = ', ')
+              } else {
+                pairwise_results <- paste(pairwise_results, 'SCZ > HC', sep = ', ')
+              }
+            }
+            age_table[j,k] <- paste(pairwise_results)
+          }
+                
+          k <- 1 # reset counter so it's back to column 1
+          j <- j + 1 # advance to the next row (i.e., the next variable)
+    }   
+
+View(age_table)
+
+```
+
+```{r stats}
+
+#standard error of each delta
+(std.error(age_df$pred_age[age_df$dx == 'SCZ']))
+(std.error(age_df$pred_age[age_df$dx == 'HC']))
+(std.error(age_df$pred_age[age_df$dx == 'BD']))
+
+#ANOVA of deltas
+(delta_anova <- aov(age_df$delta ~ age_df$dx))
+
+#t-values of deltas 
+(t_BD_HC <- t.test(age_df$delta ~ dx, data = age_df, age_df$dx == "BD" | age_df$dx == "HC", var.equal = TRUE))
+(t_BD_SCZ <- t.test(age_df$delta ~ dx, data = age_df, age_df$dx == "BD" | age_df$dx == "SCZ", var.equal = TRUE))
+(t_HC_SCZ <- t.test(age_df$delta ~ dx, data = age_df, age_df$dx == "HC" | age_df$dx == "SCZ", var.equal = TRUE))
+
+```
+
+```{r boxplot}
+
+library(ggplot2)
+
+#set diagnosis factors to determine order on boxplot
+age_df$dx <- factor(age_df$dx, levels = c('HC', 'SCZ', 'BD'), labels = c('HC', 'SSD', 'BD'))
+
+#boxplot
+p<- ggplot(age_df, aes(dx, delta)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(dx, delta),
+    position=position_jitter(width=0.3,height=0.3)) +
+    xlab("Group") +
+    ylab("Age delta") +
+    theme_bw()
+
+```
+
